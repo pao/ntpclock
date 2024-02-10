@@ -3,8 +3,7 @@
 
 #include <string>
 
-#include "sml.hpp"
-namespace sml = boost::sml;
+#include "sml2"
 
 struct network_event {
   WiFiEvent_t ev{};
@@ -38,22 +37,18 @@ struct when {
   }
 };
 
-struct sm_sys {
-  auto operator()() const {
-    using namespace sml;
-    return make_transition_table(
-        // clang-format off
-      *"eth_uninitialized"_s + event<network_event>[when<ARDUINO_EVENT_ETH_START>{}] / start_network = "eth_disconnected"_s
-      ,"eth_disconnected"_s + event<network_event>[when<ARDUINO_EVENT_ETH_CONNECTED>{}] / connect_network = "eth_connected"_s
-      ,"eth_connected"_s + event<network_event>[when<ARDUINO_EVENT_ETH_DISCONNECTED>{}] / disconnect_network = "eth_disconnected"_s
-      ,"eth_connected"_s + event<network_event>[when<ARDUINO_EVENT_ETH_GOT_IP>{}] / got_ip = "eth_ready"_s
-      ,"eth_ready"_s + event<network_event>[when<ARDUINO_EVENT_ETH_DISCONNECTED>{}] / disconnect_network = "eth_disconnected"_s
-        // clang-format on
-    );
+sml::sm sys = [] {
+  using namespace sml::dsl;
+  return transition_table{
+    // clang-format off
+    *"eth_uninitialized"_s + event<network_event>[when<ARDUINO_EVENT_ETH_START>{}] / start_network = "eth_disconnected"_s
+    ,"eth_disconnected"_s + event<network_event>[when<ARDUINO_EVENT_ETH_CONNECTED>{}] / connect_network = "eth_connected"_s
+    ,"eth_connected"_s + event<network_event>[when<ARDUINO_EVENT_ETH_DISCONNECTED>{}] / disconnect_network = "eth_disconnected"_s
+    ,"eth_connected"_s + event<network_event>[when<ARDUINO_EVENT_ETH_GOT_IP>{}] / got_ip = "eth_ready"_s
+    ,"eth_ready"_s + event<network_event>[when<ARDUINO_EVENT_ETH_DISCONNECTED>{}] / disconnect_network = "eth_disconnected"_s
+    // clang-format on
   };
 };
-
-sml::sm<sm_sys> sys{};
 
 void setup() {
   Serial.begin(9600);
