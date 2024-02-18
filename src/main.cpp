@@ -1,11 +1,14 @@
 #include <Arduino.h>
 #include <ETH.h>
+#include <Wire.h>
 
 #include <chrono>
 #include <string>
 
 #include "TinyGPSPlus.h"
 #include "sml2"
+#include "Adafruit_GFX.h"
+#include "Adafruit_SSD1306.h"
 
 template <typename Duration>
 auto increment_time(TinyGPSTime gpsTime, Duration increment) {
@@ -85,17 +88,30 @@ sml::sm timesync = [] {
 };
 */
 
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 32 // OLED display height, in pixels
+#define SCREEN_ADDRESS 0x3C ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
+Adafruit_SSD1306 display{SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1};
+
 void setup() {
   // Debug console setup
   Serial.begin(9600);
 
+  // OLED setup
+  // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for(;;); // Don't proceed, loop forever
+  }
+  display.clearDisplay();
+  display.setTextSize(2); // Draw 2X-scale text
+  display.setTextColor(SSD1306_WHITE);
+
   // GNSS module setup
   Serial2.begin(9600, SERIAL_8N1, IO14, IO15);
-  Serial2.print("$PMTK251,38400*27\r\n");
-  Serial2.updateBaudRate(38400);
-  delay(100);
   Serial2.print("$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*28\r\n");
   Serial2.print("$PMTK255,1*2D\r\n");
+  Serial2.flush();
 
   // ETH setup
   WiFi.onEvent(
@@ -113,20 +129,22 @@ void loop() {
   using namespace std::chrono;
   using namespace std::chrono_literals;
   if (xSemaphoreTake(ppsSemaphore, 0) == pdTRUE) {
+    display.clearDisplay();
+      display.setCursor(0, 0);
     if (gnss.sentencesWithFix() > 0 && gnss.time.isValid()) {
       auto display_time = increment_time(gnss.time, 1s);
       auto display_date = increment_date(
-          gnss.date, (gnss.time.hour() < display_time.hours().count())
+          gnss.date, (gnss.time.hour() > display_time.hours().count())
                          ? days{1}
                          : days{0});
-      Serial.printf("corrected:   %04d-%02d-%02dT%02lld:%02lld:%02lld\n", int{display_date.year()},
+      display.printf("%04d-%02d-%02d\n%02lld:%02lld:%02lld", int{display_date.year()},
                     unsigned{display_date.month()}, unsigned{display_date.day()},
                     display_time.hours().count(), display_time.minutes().count(),
                     display_time.seconds().count());
-      Serial.printf("uncorrected: %04d-%02d-%02dT%02d:%02d:%02d\n", gnss.date.year(),
-                    gnss.date.month(), gnss.date.day(), gnss.time.hour(),
-                    gnss.time.minute(), gnss.time.second());
+    } else {
+      display.print("No fix...");
     }
+      display.display();
     Serial2.flush();
     delay(800);
     while (Serial2.available()) {
