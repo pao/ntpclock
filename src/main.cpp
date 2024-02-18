@@ -5,10 +5,16 @@
 #include <chrono>
 #include <string>
 
-#include "TinyGPSPlus.h"
-#include "sml2"
 #include "Adafruit_GFX.h"
 #include "Adafruit_SSD1306.h"
+#include "TinyGPSPlus.h"
+#include "sml2"
+
+#define SCREEN_WIDTH 128  // OLED display width, in pixels
+#define SCREEN_HEIGHT 32  // OLED display height, in pixels
+#define SCREEN_ADDRESS \
+  0x3C  ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
+Adafruit_SSD1306 display{SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1};
 
 template <typename Duration>
 auto increment_time(TinyGPSTime gpsTime, Duration increment) {
@@ -72,26 +78,33 @@ sml::sm connection = [] {
 
 volatile SemaphoreHandle_t ppsSemaphore{};
 TinyGPSPlus gnss{};
-struct have_fine_time {};
+struct have_fix {};
 struct pps_pulse {};
+
+auto debug_fixed = [] { Serial.print("fixed!\n"); };
+auto debug_updating = [] { Serial.print("updating!\n"); };
 
 auto pps = [] { xSemaphoreGiveFromISR(ppsSemaphore, nullptr); };
 
-/*
 sml::sm timesync = [] {
   using namespace sml::dsl;
   return transition_table{
-    // clang-format off
-    *"init"_s + event<
-    // clang-format on
+      // clang-format off
+    *"init"_s + event<have_fix> / debug_fixed = "fixed"_s,
+     "fixed"_s + event<pps_pulse> / debug_updating = "updating"_s,
+     "updating"_s + event<pps_pulse> / pps,
+      // clang-format on
   };
 };
-*/
 
-#define SCREEN_WIDTH 128 // OLED display width, in pixels
-#define SCREEN_HEIGHT 32 // OLED display height, in pixels
-#define SCREEN_ADDRESS 0x3C ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
-Adafruit_SSD1306 display{SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1};
+auto process_nmea = [] {
+  while (Serial2.available()) {
+    gnss.encode(Serial2.read());
+  }
+  if (gnss.location.isValid()) {
+    timesync.process_event(have_fix{});
+  }
+};
 
 void setup() {
   // Debug console setup
@@ -99,19 +112,22 @@ void setup() {
 
   // OLED setup
   // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
-  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
     Serial.println(F("SSD1306 allocation failed"));
-    for(;;); // Don't proceed, loop forever
+    for (;;) {
+    }  // Don't proceed, loop forever
   }
   display.clearDisplay();
-  display.setTextSize(2); // Draw 2X-scale text
+  display.setTextSize(2);  // Draw 2X-scale text
   display.setTextColor(SSD1306_WHITE);
+  display.display();
 
   // GNSS module setup
   Serial2.begin(9600, SERIAL_8N1, IO14, IO15);
   Serial2.print("$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*28\r\n");
   Serial2.print("$PMTK255,1*2D\r\n");
   Serial2.flush();
+  Serial2.onReceive(process_nmea, false);
 
   // ETH setup
   WiFi.onEvent(
@@ -122,33 +138,36 @@ void setup() {
   constexpr auto pps_pin = IO36;
   ppsSemaphore = xSemaphoreCreateBinary();
   pinMode(pps_pin, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(pps_pin), pps, FALLING);
+  attachInterrupt(
+      digitalPinToInterrupt(pps_pin),
+      [] { timesync.process_event(pps_pulse{}); }, FALLING);
 }
 
-void loop() {
-  using namespace std::chrono;
-  using namespace std::chrono_literals;
-  if (xSemaphoreTake(ppsSemaphore, 0) == pdTRUE) {
-    display.clearDisplay();
-      display.setCursor(0, 0);
+auto update_display = [] {    display.clearDisplay();
+    using namespace std::chrono;
+    using namespace std::chrono_literals;
+    display.setCursor(0, 0);
     if (gnss.sentencesWithFix() > 0 && gnss.time.isValid()) {
       auto display_time = increment_time(gnss.time, 1s);
       auto display_date = increment_date(
           gnss.date, (gnss.time.hour() > display_time.hours().count())
                          ? days{1}
                          : days{0});
-      display.printf("%04d-%02d-%02d\n%02lld:%02lld:%02lld", int{display_date.year()},
-                    unsigned{display_date.month()}, unsigned{display_date.day()},
-                    display_time.hours().count(), display_time.minutes().count(),
-                    display_time.seconds().count());
+      display.printf("%04d-%02d-%02d\n%02lld:%02lld:%02lld",
+                     int{display_date.year()}, unsigned{display_date.month()},
+                     unsigned{display_date.day()}, display_time.hours().count(),
+                     display_time.minutes().count(),
+                     display_time.seconds().count());
     } else {
       display.print("No fix...");
     }
-      display.display();
-    Serial2.flush();
-    delay(800);
-    while (Serial2.available()) {
-      gnss.encode(Serial2.read());
-    }
+    display.display();
+};
+
+void loop() {
+  // this will turn into a dispatch loop on an event queue driven by the various
+  // state machines
+  if (xSemaphoreTake(ppsSemaphore, 0) == pdTRUE) {
+    update_display();
   }
 }
