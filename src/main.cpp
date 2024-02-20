@@ -1,13 +1,16 @@
 #include <Arduino.h>
 #include <ETH.h>
+#include <HTTPClient.h>
 #include <Wire.h>
 
 #include <chrono>
 #include <string>
+#include <string_view>
 
 #include "Adafruit_GFX.h"
 #include "Adafruit_SSD1306.h"
 #include "TinyGPSPlus.h"
+#include "api_key.h"
 #include "sml2"
 
 #define SCREEN_WIDTH 128  // OLED display width, in pixels
@@ -53,7 +56,9 @@ auto got_ip = [] {
   }
   Serial.print(", ");
   Serial.print(ETH.linkSpeed());
-  Serial.println("Mbps");
+  Serial.print("Mbps");
+  Serial.print(", DNS: ");
+  Serial.println(ETH.dnsIP());
 };
 
 template <WiFiEvent_t ev>
@@ -86,12 +91,57 @@ auto debug_updating = [] { Serial.print("updating!\n"); };
 
 auto pps = [] { xSemaphoreGiveFromISR(ppsSemaphore, nullptr); };
 
+constexpr void add_query_parameter(std::string& uri, std::string_view key,
+                                   std::string_view value) {
+  uri.reserve(uri.size() + key.size() + value.size() + 2);
+  uri.append({'&'});
+  uri.append(key.cbegin(), key.cend());
+  uri.append({'='});
+  uri.append(value.cbegin(), value.cend());
+}
+
+void add_query_parameter(std::string& uri, std::string_view key, double value) {
+  add_query_parameter(uri, key, std::to_string(value));
+}
+
+TaskHandle_t http_stuff{};
+
+auto tz_api_query = [] (void*) {
+  std::string api = "http://api.timezonedb.com/v2.1/get-time-zone?";
+  add_query_parameter(api, "key", api_key);
+  add_query_parameter(api, "format", "json");
+  add_query_parameter(api, "by", "position");
+  add_query_parameter(api, "lat", gnss.location.lat());
+  add_query_parameter(api, "lng", gnss.location.lng());
+  HTTPClient http{};
+  Serial.println(api.c_str());
+  http.begin(api.c_str());
+  auto httpResponseCode = http.GET();
+  if (httpResponseCode < 0) {
+    Serial.println("Failed to get tzapi data :(");
+    vTaskDelete(http_stuff);
+    return;
+  }
+  Serial.println(http.getString());
+  http.end();
+  vTaskDelete(http_stuff);
+};
+
+auto determine_tz_from_position = [] {
+    xTaskCreatePinnedToCore(tz_api_query, "api_query", 10000, nullptr, 0, &http_stuff, 0);
+};
+
+auto is_connection_ready = [] {
+  using namespace sml::dsl;
+  return connection.is("ready"_s);
+};
+
 sml::sm timesync = [] {
   using namespace sml::dsl;
   return transition_table{
       // clang-format off
     *"init"_s + event<have_fix> / debug_fixed = "fixed"_s,
-     "fixed"_s + event<pps_pulse> / debug_updating = "updating"_s,
+     "fixed"_s + event<pps_pulse>[is_connection_ready] / determine_tz_from_position = "updating"_s,
      "updating"_s + event<pps_pulse> / pps,
       // clang-format on
   };
@@ -101,7 +151,8 @@ auto process_nmea = [] {
   while (Serial2.available()) {
     gnss.encode(Serial2.read());
   }
-  if (gnss.location.isValid()) {
+  if (gnss.sentencesWithFix() > 0 && gnss.time.isValid() &&
+      gnss.location.isValid()) {
     timesync.process_event(have_fix{});
   }
 };
@@ -118,9 +169,11 @@ void setup() {
     }  // Don't proceed, loop forever
   }
   display.clearDisplay();
-  display.setTextSize(2);  // Draw 2X-scale text
+  display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
+  display.print("Waiting for fix...");
   display.display();
+  display.setTextSize(2);
 
   // GNSS module setup
   Serial2.begin(9600, SERIAL_8N1, IO14, IO15);
@@ -143,25 +196,21 @@ void setup() {
       [] { timesync.process_event(pps_pulse{}); }, FALLING);
 }
 
-auto update_display = [] {    display.clearDisplay();
-    using namespace std::chrono;
-    using namespace std::chrono_literals;
-    display.setCursor(0, 0);
-    if (gnss.sentencesWithFix() > 0 && gnss.time.isValid()) {
-      auto display_time = increment_time(gnss.time, 1s);
-      auto display_date = increment_date(
-          gnss.date, (gnss.time.hour() > display_time.hours().count())
-                         ? days{1}
-                         : days{0});
-      display.printf("%04d-%02d-%02d\n%02lld:%02lld:%02lld",
-                     int{display_date.year()}, unsigned{display_date.month()},
-                     unsigned{display_date.day()}, display_time.hours().count(),
-                     display_time.minutes().count(),
-                     display_time.seconds().count());
-    } else {
-      display.print("No fix...");
-    }
-    display.display();
+auto update_display = [] {
+  display.clearDisplay();
+  using namespace std::chrono;
+  using namespace std::chrono_literals;
+  display.setCursor(0, 0);
+  auto display_time = increment_time(gnss.time, 1s);
+  auto display_date = increment_date(
+      gnss.date,
+      (gnss.time.hour() > display_time.hours().count()) ? days{1} : days{0});
+  display.printf("%04d-%02d-%02d\n%02lld:%02lld:%02lld",
+                 int{display_date.year()}, unsigned{display_date.month()},
+                 unsigned{display_date.day()}, display_time.hours().count(),
+                 display_time.minutes().count(),
+                 display_time.seconds().count());
+  display.display();
 };
 
 void loop() {
