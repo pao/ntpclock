@@ -6,9 +6,11 @@
 #include <chrono>
 #include <string>
 #include <string_view>
+#include <tuple>
 
 #include "Adafruit_GFX.h"
 #include "Adafruit_SSD1306.h"
+#include "ArduinoJson.h"
 #include "TinyGPSPlus.h"
 #include "api_key.h"
 #include "sml2"
@@ -20,18 +22,15 @@
 Adafruit_SSD1306 display{SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1};
 
 template <typename Duration>
-auto increment_time(TinyGPSTime gpsTime, Duration increment) {
+auto adjust_time(TinyGPSDate gpsDate, TinyGPSTime gpsTime,
+                 Duration adjustment) {
   using namespace std::chrono;
-  return hh_mm_ss{hours{gpsTime.hour()} + minutes{gpsTime.minute()} +
-                  seconds{gpsTime.second()} + increment};
-}
-
-template <typename Duration>
-auto increment_date(TinyGPSDate gpsDate, Duration increment) {
-  using namespace std::chrono;
-  return year_month_day{sys_days{year{gpsDate.year()} / month{gpsDate.month()} /
-                                 day{gpsDate.day()}} +
-                        increment};
+  auto adjusted = sys_days{year{gpsDate.year()} / month{gpsDate.month()} /
+                      day{gpsDate.day()}} +
+             hours{gpsTime.hour()} + minutes{gpsTime.minute()} +
+             seconds{gpsTime.second()} + adjustment;
+  auto date = year_month_day{floor<days>(adjusted)};
+  return std::tuple{date, hh_mm_ss{adjusted - sys_days{date}}};
 }
 
 struct network_event {
@@ -106,7 +105,9 @@ void add_query_parameter(std::string& uri, std::string_view key, double value) {
 
 TaskHandle_t http_stuff{};
 
-auto tz_api_query = [] (void*) {
+std::chrono::seconds tz_offset{0};
+
+auto tz_api_query = [](void*) {
   std::string api = "http://api.timezonedb.com/v2.1/get-time-zone?";
   add_query_parameter(api, "key", api_key);
   add_query_parameter(api, "format", "json");
@@ -122,13 +123,29 @@ auto tz_api_query = [] (void*) {
     vTaskDelete(http_stuff);
     return;
   }
-  Serial.println(http.getString());
+  // Serial.println(http.getString());
+
+  JsonDocument doc{};
+
+  // Parse JSON object
+  DeserializationError error = deserializeJson(doc, http.getString());
   http.end();
+  if (error) {
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.f_str());
+    vTaskDelete(http_stuff);
+    return;
+  }
+
+  tz_offset = std::chrono::seconds{doc["gmtOffset"].as<long>()};
+  Serial.printf("offset: %ld\n", doc["gmtOffset"].as<long>());
+
   vTaskDelete(http_stuff);
 };
 
 auto determine_tz_from_position = [] {
-    xTaskCreatePinnedToCore(tz_api_query, "api_query", 10000, nullptr, 0, &http_stuff, 0);
+  xTaskCreatePinnedToCore(tz_api_query, "api_query", 10000, nullptr, 0,
+                          &http_stuff, 0);
 };
 
 auto is_connection_ready = [] {
@@ -201,10 +218,14 @@ auto update_display = [] {
   using namespace std::chrono;
   using namespace std::chrono_literals;
   display.setCursor(0, 0);
-  auto display_time = increment_time(gnss.time, 1s);
-  auto display_date = increment_date(
-      gnss.date,
-      (gnss.time.hour() > display_time.hours().count()) ? days{1} : days{0});
+  auto [display_date, display_time] =
+      adjust_time(gnss.date, gnss.time, tz_offset + 1s);
+  /*   auto display_time = increment_time(gnss.time, tz_offset + 1s);
+    auto display_date = increment_date(
+        gnss.date,
+        (gnss.time.hour() > display_time.hours().count()) ? days{1} :
+    days{0});
+   */
   display.printf("%04d-%02d-%02d\n%02lld:%02lld:%02lld",
                  int{display_date.year()}, unsigned{display_date.month()},
                  unsigned{display_date.day()}, display_time.hours().count(),
@@ -214,8 +235,8 @@ auto update_display = [] {
 };
 
 void loop() {
-  // this will turn into a dispatch loop on an event queue driven by the various
-  // state machines
+  // this will turn into a dispatch loop on an event queue driven by the
+  // various state machines
   if (xSemaphoreTake(ppsSemaphore, 0) == pdTRUE) {
     update_display();
   }
