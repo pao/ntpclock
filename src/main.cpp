@@ -21,16 +21,18 @@
   0x3C  ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
 Adafruit_SSD1306 display{SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1};
 
-template <typename Duration>
-auto adjust_time(TinyGPSDate gpsDate, TinyGPSTime gpsTime,
-                 Duration adjustment) {
+auto to_chrono(TinyGPSDate gpsDate, TinyGPSTime gpsTime) {
   using namespace std::chrono;
-  auto adjusted = sys_days{year{gpsDate.year()} / month{gpsDate.month()} /
-                      day{gpsDate.day()}} +
-             hours{gpsTime.hour()} + minutes{gpsTime.minute()} +
-             seconds{gpsTime.second()} + adjustment;
-  auto date = year_month_day{floor<days>(adjusted)};
-  return std::tuple{date, hh_mm_ss{adjusted - sys_days{date}}};
+  return sys_days{year{gpsDate.year()} / month{gpsDate.month()} /
+                  day{gpsDate.day()}} +
+         hours{gpsTime.hour()} + minutes{gpsTime.minute()} +
+         seconds{gpsTime.second()};
+}
+
+auto format_time(std::chrono::sys_seconds time) {
+  using namespace std::chrono;
+  auto date = year_month_day{floor<days>(time)};
+  return std::tuple{date, hh_mm_ss{time - sys_days{date}}};
 }
 
 struct network_event {
@@ -82,8 +84,9 @@ sml::sm connection = [] {
 
 volatile SemaphoreHandle_t ppsSemaphore{};
 TinyGPSPlus gnss{};
-struct have_fix {};
+struct got_fix {};
 struct pps_pulse {};
+struct got_tzoffset {};
 
 auto debug_fixed = [] { Serial.print("fixed!\n"); };
 auto debug_updating = [] { Serial.print("updating!\n"); };
@@ -105,9 +108,56 @@ void add_query_parameter(std::string& uri, std::string_view key, double value) {
 
 TaskHandle_t http_stuff{};
 
-std::chrono::seconds tz_offset{0};
+struct tz_params_t {
+  std::chrono::seconds offset{0};
+  std::chrono::sys_seconds valid_until_utc{};
+  bool is_dst{0};
+};
 
-auto tz_api_query = [](void*) {
+tz_params_t tz_params{};
+
+std::chrono::sys_seconds current_time_utc{};
+
+// forward declaration
+auto tz_api_query(void*) -> void;
+
+auto determine_tz_from_position = [] {
+  xTaskCreatePinnedToCore(tz_api_query, "api_query", 10000, nullptr, 0,
+                          &http_stuff, 0);
+};
+
+auto is_connection_ready = [] {
+  using namespace sml::dsl;
+  return connection.is("ready"_s);
+};
+
+auto tz_not_valid = [] {
+  return current_time_utc >= tz_params.valid_until_utc;
+};
+
+// immediately change DST until we can query the API again to be sure
+auto toggle_dst = [] {
+  using namespace std::chrono_literals;
+  tz_params.offset += tz_params.is_dst ? -3600s : 3600s;
+  tz_params.is_dst = !tz_params.is_dst;
+};
+
+sml::sm timesync = [] {
+  using namespace sml::dsl;
+  return transition_table{
+      // clang-format off
+    *"init"_s + event<got_fix> / debug_fixed = "no_tz"_s,
+     "no_tz"_s + event<pps_pulse>[is_connection_ready] / []{pps(); determine_tz_from_position();} = "updating"_s,
+     "no_tz"_s + event<pps_pulse> / pps,
+     "updating"_s + event<pps_pulse> / pps,
+     "updating"_s + event<got_tzoffset> = "have_tz"_s,
+     "have_tz"_s + event<pps_pulse>[tz_not_valid] / []{toggle_dst(); pps();} = "no_tz"_s,
+     "have_tz"_s + event<pps_pulse> / pps,
+      // clang-format on
+  };
+};
+
+auto tz_api_query(void*) -> void {
   std::string api = "http://api.timezonedb.com/v2.1/get-time-zone?";
   add_query_parameter(api, "key", api_key);
   add_query_parameter(api, "format", "json");
@@ -123,8 +173,6 @@ auto tz_api_query = [](void*) {
     vTaskDelete(http_stuff);
     return;
   }
-  // Serial.println(http.getString());
-
   JsonDocument doc{};
 
   // Parse JSON object
@@ -137,31 +185,16 @@ auto tz_api_query = [](void*) {
     return;
   }
 
-  tz_offset = std::chrono::seconds{doc["gmtOffset"].as<long>()};
+  tz_params.offset = std::chrono::seconds{doc["gmtOffset"].as<long>()};
   Serial.printf("offset: %ld\n", doc["gmtOffset"].as<long>());
 
+  tz_params.is_dst = doc["dst"].as<bool>();
+  tz_params.valid_until_utc =
+      std::chrono::sys_seconds{std::chrono::seconds{doc["zoneEnd"].as<long>()}};
+
+  timesync.process_event(got_tzoffset{});
+
   vTaskDelete(http_stuff);
-};
-
-auto determine_tz_from_position = [] {
-  xTaskCreatePinnedToCore(tz_api_query, "api_query", 10000, nullptr, 0,
-                          &http_stuff, 0);
-};
-
-auto is_connection_ready = [] {
-  using namespace sml::dsl;
-  return connection.is("ready"_s);
-};
-
-sml::sm timesync = [] {
-  using namespace sml::dsl;
-  return transition_table{
-      // clang-format off
-    *"init"_s + event<have_fix> / debug_fixed = "fixed"_s,
-     "fixed"_s + event<pps_pulse>[is_connection_ready] / determine_tz_from_position = "updating"_s,
-     "updating"_s + event<pps_pulse> / pps,
-      // clang-format on
-  };
 };
 
 auto process_nmea = [] {
@@ -170,7 +203,7 @@ auto process_nmea = [] {
   }
   if (gnss.sentencesWithFix() > 0 && gnss.time.isValid() &&
       gnss.location.isValid()) {
-    timesync.process_event(have_fix{});
+    timesync.process_event(got_fix{});
   }
 };
 
@@ -218,14 +251,9 @@ auto update_display = [] {
   using namespace std::chrono;
   using namespace std::chrono_literals;
   display.setCursor(0, 0);
+  current_time_utc = to_chrono(gnss.date, gnss.time) + 1s;
   auto [display_date, display_time] =
-      adjust_time(gnss.date, gnss.time, tz_offset + 1s);
-  /*   auto display_time = increment_time(gnss.time, tz_offset + 1s);
-    auto display_date = increment_date(
-        gnss.date,
-        (gnss.time.hour() > display_time.hours().count()) ? days{1} :
-    days{0});
-   */
+      format_time(current_time_utc + tz_params.offset);
   display.printf("%04d-%02d-%02d\n%02lld:%02lld:%02lld",
                  int{display_date.year()}, unsigned{display_date.month()},
                  unsigned{display_date.day()}, display_time.hours().count(),
