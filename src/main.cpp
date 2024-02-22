@@ -87,6 +87,7 @@ TinyGPSPlus gnss{};
 struct got_fix {};
 struct pps_pulse {};
 struct got_tzoffset {};
+struct failed_tzoffset {};
 
 auto debug_fixed = [] { Serial.print("fixed!\n"); };
 auto debug_updating = [] { Serial.print("updating!\n"); };
@@ -151,13 +152,22 @@ sml::sm timesync = [] {
      "no_tz"_s + event<pps_pulse> / pps,
      "updating"_s + event<pps_pulse> / pps,
      "updating"_s + event<got_tzoffset> = "have_tz"_s,
+     "updating"_s + event<failed_tzoffset> = "no_tz"_s,
      "have_tz"_s + event<pps_pulse>[tz_not_valid] / []{toggle_dst(); pps();} = "no_tz"_s,
      "have_tz"_s + event<pps_pulse> / pps,
       // clang-format on
   };
 };
 
+long tz_query_backoff{0};
+static constexpr long tz_query_backoff_increment{1000};
+static constexpr long tz_query_backoff_max{300 * 1000};
+
 auto tz_api_query(void*) -> void {
+  delay(tz_query_backoff);
+  tz_query_backoff =
+      std::min((tz_query_backoff + tz_query_backoff_increment) * 2,
+               tz_query_backoff_max);
   std::string api = "http://api.timezonedb.com/v2.1/get-time-zone?";
   add_query_parameter(api, "key", api_key);
   add_query_parameter(api, "format", "json");
@@ -170,6 +180,7 @@ auto tz_api_query(void*) -> void {
   auto httpResponseCode = http.GET();
   if (httpResponseCode < 0) {
     Serial.println("Failed to get tzapi data :(");
+    timesync.process_event(failed_tzoffset{});
     vTaskDelete(http_stuff);
     return;
   }
@@ -181,6 +192,7 @@ auto tz_api_query(void*) -> void {
   if (error) {
     Serial.print(F("deserializeJson() failed: "));
     Serial.println(error.f_str());
+    timesync.process_event(failed_tzoffset{});
     vTaskDelete(http_stuff);
     return;
   }
@@ -191,7 +203,7 @@ auto tz_api_query(void*) -> void {
   tz_params.is_dst = doc["dst"].as<bool>();
   tz_params.valid_until_utc =
       std::chrono::sys_seconds{std::chrono::seconds{doc["zoneEnd"].as<long>()}};
-
+  tz_query_backoff = 0;
   timesync.process_event(got_tzoffset{});
 
   vTaskDelete(http_stuff);
