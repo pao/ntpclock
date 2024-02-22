@@ -113,6 +113,7 @@ struct tz_params_t {
   std::chrono::seconds offset{0};
   std::chrono::sys_seconds valid_until_utc{};
   bool is_dst{0};
+  bool has_dst{0};
 };
 
 tz_params_t tz_params{};
@@ -138,6 +139,9 @@ auto tz_not_valid = [] {
 
 // immediately change DST until we can query the API again to be sure
 auto toggle_dst = [] {
+  if (!tz_params.has_dst) {
+    return;
+  }
   using namespace std::chrono_literals;
   tz_params.offset += tz_params.is_dst ? -3600s : 3600s;
   tz_params.is_dst = !tz_params.is_dst;
@@ -198,11 +202,13 @@ auto tz_api_query(void*) -> void {
   }
 
   tz_params.offset = std::chrono::seconds{doc["gmtOffset"].as<long>()};
-  Serial.printf("offset: %ld\n", doc["gmtOffset"].as<long>());
-
+  tz_params.has_dst = (doc["dst"].as<const char*>() != nullptr);
   tz_params.is_dst = doc["dst"].as<bool>();
-  tz_params.valid_until_utc =
-      std::chrono::sys_seconds{std::chrono::seconds{doc["zoneEnd"].as<long>()}};
+  tz_params.valid_until_utc = std::chrono::sys_seconds{
+      std::chrono::seconds{doc["zoneEnd"] | std::numeric_limits<long>::max()}};
+  Serial.printf("offset: %ld, dst?: %d, dst: %d\n", doc["gmtOffset"].as<long>(),
+                tz_params.has_dst, tz_params.is_dst);
+
   tz_query_backoff = 0;
   timesync.process_event(got_tzoffset{});
 
