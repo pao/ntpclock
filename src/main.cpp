@@ -203,7 +203,7 @@ auto tz_api_query(void*) -> void {
 
   tz_params.offset = std::chrono::seconds{doc["gmtOffset"].as<long>()};
   tz_params.has_dst = (doc["dst"].as<const char*>() != nullptr);
-  tz_params.is_dst = doc["dst"].as<bool>();
+  tz_params.is_dst = (doc["dst"].as<std::string>() == "1");
   tz_params.valid_until_utc = std::chrono::sys_seconds{
       std::chrono::seconds{doc["zoneEnd"] | std::numeric_limits<long>::max()}};
   Serial.printf("offset: %ld, dst?: %d, dst: %d\n", doc["gmtOffset"].as<long>(),
