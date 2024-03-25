@@ -12,6 +12,7 @@
 #include "Adafruit_SSD1306.h"
 #include "ArduinoJson.h"
 #include "TinyGPSPlus.h"
+#include "WiFiNTPServer.h"
 #include "api_key.h"
 #include "sml2"
 
@@ -27,6 +28,12 @@ auto to_chrono(TinyGPSDate gpsDate, TinyGPSTime gpsTime) {
                   day{gpsDate.day()}} +
          hours{gpsTime.hour()} + minutes{gpsTime.minute()} +
          seconds{gpsTime.second()};
+}
+
+void to_tm(struct tm* ref_time,
+           std::chrono::sys_time<std::chrono::milliseconds> utc_time) {
+  const auto tt = std::chrono::system_clock::to_time_t(utc_time);
+  *ref_time = *std::gmtime(&tt);
 }
 
 auto format_time(std::chrono::sys_seconds time) {
@@ -83,6 +90,7 @@ sml::sm connection = [] {
 };
 
 volatile SemaphoreHandle_t ppsSemaphore{};
+volatile SemaphoreHandle_t ref_time_mutex{};
 TinyGPSPlus gnss{};
 struct got_fix {};
 struct pps_pulse {};
@@ -108,6 +116,7 @@ void add_query_parameter(std::string& uri, std::string_view key, double value) {
 }
 
 TaskHandle_t http_stuff{};
+TaskHandle_t ntp_responder{};
 
 struct tz_params_t {
   std::chrono::seconds offset{0};
@@ -122,10 +131,19 @@ std::chrono::sys_seconds current_time_utc{};
 
 // forward declaration
 auto tz_api_query(void*) -> void;
+auto serve_ntp(void*) -> void;
 
 auto determine_tz_from_position = [] {
+  if (ntp_responder) {
+    vTaskDelete(ntp_responder);
+    ntp_responder = nullptr;
+  }
   xTaskCreatePinnedToCore(tz_api_query, "api_query", 10000, nullptr, 0,
                           &http_stuff, 0);
+};
+
+auto serve_ntp_clients = [] {
+  xTaskCreate(serve_ntp, "serve ntp", 10000, nullptr, 0, &ntp_responder);
 };
 
 auto is_connection_ready = [] {
@@ -155,7 +173,7 @@ sml::sm timesync = [] {
      "no_tz"_s + event<pps_pulse>[is_connection_ready] / []{pps(); determine_tz_from_position();} = "updating"_s,
      "no_tz"_s + event<pps_pulse> / pps,
      "updating"_s + event<pps_pulse> / pps,
-     "updating"_s + event<got_tzoffset> = "have_tz"_s,
+     "updating"_s + event<got_tzoffset> / serve_ntp_clients = "have_tz"_s,
      "updating"_s + event<failed_tzoffset> = "no_tz"_s,
      "have_tz"_s + event<pps_pulse>[tz_not_valid] / []{toggle_dst(); pps();} = "no_tz"_s,
      "have_tz"_s + event<pps_pulse> / pps,
@@ -225,6 +243,21 @@ auto process_nmea = [] {
   }
 };
 
+WiFiNTPServer ntp_server("GPS", L_NTP_STRAT_PRIMARY);
+unsigned long micros_at_last_pps{};
+tm ref_time_at_last_pps{};
+bool in_between_updates{true};
+
+auto serve_ntp(void*) -> void {
+  while (true) {
+    if (!in_between_updates && xSemaphoreTake(ref_time_mutex, 0) == pdTRUE) {
+      ntp_server.setReferenceTime(ref_time_at_last_pps, micros_at_last_pps);
+      xSemaphoreGive(ref_time_mutex);
+    }
+    ntp_server.update();
+  }
+}
+
 void setup() {
   // Debug console setup
   Serial.begin(9600);
@@ -255,23 +288,39 @@ void setup() {
       [](WiFiEvent_t ev) { connection.process_event(network_event{ev}); });
   ETH.begin();
 
+  ref_time_mutex = xSemaphoreCreateMutex();
+  ntp_server.begin();
+
   // PPS setup
   constexpr auto pps_pin = IO36;
   ppsSemaphore = xSemaphoreCreateBinary();
   pinMode(pps_pin, INPUT_PULLUP);
   attachInterrupt(
       digitalPinToInterrupt(pps_pin),
-      [] { timesync.process_event(pps_pulse{}); }, FALLING);
+      [] {
+        if (xSemaphoreTake(ref_time_mutex, 0) == pdTRUE) {
+          micros_at_last_pps = esp_timer_get_time();
+          in_between_updates = true;
+          xSemaphoreGive(ref_time_mutex);
+        }
+        timesync.process_event(pps_pulse{});
+      },
+      FALLING);
 }
 
 auto update_display = [] {
   display.clearDisplay();
   using namespace std::chrono;
   using namespace std::chrono_literals;
-  display.setCursor(0, 0);
   current_time_utc = to_chrono(gnss.date, gnss.time) + 1s;
+  if (xSemaphoreTake(ref_time_mutex, 0) == pdTRUE) {
+    to_tm(&ref_time_at_last_pps, current_time_utc);
+    in_between_updates = false;
+    xSemaphoreGive(ref_time_mutex);
+  }
   auto [display_date, display_time] =
       format_time(current_time_utc + tz_params.offset);
+  display.setCursor(0, 0);
   display.printf("%04d-%02d-%02d\n%02lld:%02lld:%02lld",
                  int{display_date.year()}, unsigned{display_date.month()},
                  unsigned{display_date.day()}, display_time.hours().count(),
