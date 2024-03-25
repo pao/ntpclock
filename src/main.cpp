@@ -289,12 +289,13 @@ void setup() {
   ETH.begin();
 
   ref_time_mutex = xSemaphoreCreateMutex();
+  ntp_server.setServerPrecision(0.0001);
   ntp_server.begin();
 
   // PPS setup
   constexpr auto pps_pin = IO36;
   ppsSemaphore = xSemaphoreCreateBinary();
-  pinMode(pps_pin, INPUT_PULLUP);
+  pinMode(pps_pin, INPUT_PULLDOWN);
   attachInterrupt(
       digitalPinToInterrupt(pps_pin),
       [] {
@@ -305,7 +306,7 @@ void setup() {
         }
         timesync.process_event(pps_pulse{});
       },
-      FALLING);
+      RISING);
 }
 
 auto update_display = [] {
