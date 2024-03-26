@@ -238,7 +238,8 @@ auto process_nmea = [] {
     gnss.encode(Serial2.read());
   }
   if (gnss.sentencesWithFix() > 0 && gnss.time.isValid() &&
-      gnss.location.isValid()) {
+      gnss.time.isUpdated() && gnss.location.isValid()) {
+    current_time_utc = to_chrono(gnss.date, gnss.time);
     timesync.process_event(got_fix{});
   }
 };
@@ -246,11 +247,10 @@ auto process_nmea = [] {
 WiFiNTPServer ntp_server("GPS", L_NTP_STRAT_PRIMARY);
 unsigned long micros_at_last_pps{};
 tm ref_time_at_last_pps{};
-bool in_between_updates{true};
 
 auto serve_ntp(void*) -> void {
   while (true) {
-    if (!in_between_updates && xSemaphoreTake(ref_time_mutex, 0) == pdTRUE) {
+    if (xSemaphoreTake(ref_time_mutex, 0) == pdTRUE) {
       ntp_server.setReferenceTime(ref_time_at_last_pps, micros_at_last_pps);
       xSemaphoreGive(ref_time_mutex);
     }
@@ -299,9 +299,12 @@ void setup() {
   attachInterrupt(
       digitalPinToInterrupt(pps_pin),
       [] {
+        using namespace std::chrono_literals;
+        auto micros_at_pps = esp_timer_get_time();
+        current_time_utc += 1s;
         if (xSemaphoreTake(ref_time_mutex, 0) == pdTRUE) {
-          micros_at_last_pps = esp_timer_get_time();
-          in_between_updates = true;
+          micros_at_last_pps = micros_at_pps;
+          to_tm(&ref_time_at_last_pps, current_time_utc);
           xSemaphoreGive(ref_time_mutex);
         }
         timesync.process_event(pps_pulse{});
@@ -313,12 +316,6 @@ auto update_display = [] {
   display.clearDisplay();
   using namespace std::chrono;
   using namespace std::chrono_literals;
-  current_time_utc = to_chrono(gnss.date, gnss.time) + 1s;
-  if (xSemaphoreTake(ref_time_mutex, 0) == pdTRUE) {
-    to_tm(&ref_time_at_last_pps, current_time_utc);
-    in_between_updates = false;
-    xSemaphoreGive(ref_time_mutex);
-  }
   auto [display_date, display_time] =
       format_time(current_time_utc + tz_params.offset);
   display.setCursor(0, 0);
